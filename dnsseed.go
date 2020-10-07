@@ -6,6 +6,10 @@ package main
 
 import (
 	"fmt"
+	"github.com/kaspanet/kaspad/config"
+	"github.com/kaspanet/kaspad/domainmessage"
+	"github.com/kaspanet/kaspad/netadapter/standalone"
+	"github.com/kaspanet/kaspad/protocol/common"
 	"net"
 	"os"
 	"strconv"
@@ -13,24 +17,22 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kaspanet/dnsseeder/version"
-	"github.com/kaspanet/kaspad/util/daghash"
-	"github.com/kaspanet/kaspad/util/panics"
+	"github.com/pkg/errors"
 
-	"github.com/kaspanet/kaspad/connmgr"
-	"github.com/kaspanet/kaspad/peer"
+	"github.com/kaspanet/dnsseeder/version"
+	"github.com/kaspanet/kaspad/dnsseed"
+	"github.com/kaspanet/kaspad/util/panics"
+	"github.com/kaspanet/kaspad/util/profiling"
+
 	"github.com/kaspanet/kaspad/signal"
-	"github.com/kaspanet/kaspad/wire"
+
+	_ "net/http/pprof"
 )
 
 const (
-	// nodeTimeout defines the timeout time waiting for
-	// a response from a node.
-	nodeTimeout = time.Second * 3
-
 	// requiredServices describes the default services that are
 	// required to be supported by outbound peers.
-	requiredServices = wire.SFNodeNetwork
+	requiredServices = domainmessage.SFNodeNetwork
 )
 
 var (
@@ -38,6 +40,7 @@ var (
 	wg               sync.WaitGroup
 	peersDefaultPort int
 	systemShutdown   int32
+	defaultSeeder    *domainmessage.NetAddress
 )
 
 // hostLookup returns the correct DNS lookup function to use depending on the
@@ -54,33 +57,10 @@ func hostLookup(host string) ([]net.IP, error) {
 func creep() {
 	defer wg.Done()
 
-	onAddr := make(chan struct{})
-	onVersion := make(chan struct{})
-	cfg := peer.Config{
-		UserAgentName:    "kaspa-dnsseeder",
-		UserAgentVersion: version.Version(),
-		DAGParams:        ActiveConfig().NetParams(),
-		DisableRelayTx:   true,
-		SelectedTip:      func() *daghash.Hash { return ActiveConfig().NetParams().GenesisBlock.BlockHash() },
-
-		Listeners: peer.MessageListeners{
-			OnAddr: func(p *peer.Peer, msg *wire.MsgAddr) {
-				added := amgr.AddAddresses(msg.AddrList)
-				log.Infof("Peer %v sent %v addresses, %d new",
-					p.Addr(), len(msg.AddrList), added)
-				onAddr <- struct{}{}
-			},
-			OnVersion: func(p *peer.Peer, msg *wire.MsgVersion) {
-				log.Infof("Adding peer %v with services %v and subnetword ID %v",
-					p.NA().IP.String(), msg.Services, msg.SubnetworkID)
-				// Mark this peer as a good node.
-				amgr.Good(p.NA().IP, msg.Services, msg.SubnetworkID)
-				// Ask peer for some addresses.
-				p.QueueMessage(wire.NewMsgGetAddr(true, nil), nil)
-				// notify that version is received and Peer's subnetwork ID is updated
-				onVersion <- struct{}{}
-			},
-		},
+	netAdapter, err := standalone.NewMinimalNetAdapter(&config.Config{Flags: &config.Flags{}})
+	if err != nil {
+		log.Errorf("Could not start net adapter")
+		return
 	}
 
 	var wgCreep sync.WaitGroup
@@ -88,9 +68,10 @@ func creep() {
 		peers := amgr.Addresses()
 		if len(peers) == 0 && amgr.AddressCount() == 0 {
 			// Add peers discovered through DNS to the address manager.
-			connmgr.SeedFromDNS(ActiveConfig().NetParams(), requiredServices, true, nil, hostLookup, func(addrs []*wire.NetAddress) {
-				amgr.AddAddresses(addrs)
-			})
+			dnsseed.SeedFromDNS(ActiveConfig().NetParams(), "", requiredServices, true,
+				nil, hostLookup, func(addrs []*domainmessage.NetAddress) {
+					amgr.AddAddresses(addrs)
+				})
 			peers = amgr.Addresses()
 		}
 		if len(peers) == 0 {
@@ -113,51 +94,55 @@ func creep() {
 				return
 			}
 			wgCreep.Add(1)
-			go func(addr *wire.NetAddress) {
+			go func(addr *domainmessage.NetAddress) {
 				defer wgCreep.Done()
 
-				host := net.JoinHostPort(addr.IP.String(), strconv.Itoa(int(addr.Port)))
-				p, err := peer.NewOutboundPeer(&cfg, host)
+				err := pollPeer(netAdapter, addr)
 				if err != nil {
-					log.Warnf("NewOutboundPeer on %v: %v",
-						host, err)
-					return
+					log.Warnf(err.Error())
+					if defaultSeeder != nil && addr == defaultSeeder {
+						panics.Exit(log, "failed to poll default seeder")
+					}
 				}
-				amgr.Attempt(addr.IP)
-				conn, err := net.DialTimeout("tcp", p.Addr(), nodeTimeout)
-				if err != nil {
-					log.Warnf("%v", err)
-					return
-				}
-				p.AssociateConnection(conn)
-
-				// Wait version messsage or timeout in case of failure.
-				select {
-				case <-onVersion:
-				case <-time.After(nodeTimeout):
-					log.Warnf("version timeout on peer %v",
-						p.Addr())
-					p.Disconnect()
-					return
-				}
-
-				select {
-				case <-onAddr:
-				case <-time.After(nodeTimeout):
-					log.Warnf("getaddr timeout on peer %v",
-						p.Addr())
-					p.Disconnect()
-					return
-				}
-				p.Disconnect()
 			}(addr)
 		}
 		wgCreep.Wait()
 	}
 }
 
+func pollPeer(netAdapter *standalone.MinimalNetAdapter, addr *domainmessage.NetAddress) error {
+	peerAddress := net.JoinHostPort(addr.IP.String(), strconv.Itoa(int(addr.Port)))
+
+	routes, err := netAdapter.Connect(peerAddress)
+	if err != nil {
+		return errors.Wrapf(err, "could not connect to %s", peerAddress)
+	}
+	defer routes.Disconnect()
+
+	msgRequestAddresses := domainmessage.NewMsgRequestAddresses(true, nil)
+	err = routes.OutgoingRoute.Enqueue(msgRequestAddresses)
+	if err != nil {
+		return errors.Wrapf(err, "failed to request addresses from %s", peerAddress)
+	}
+
+	message, err := routes.WaitForMessageOfType(domainmessage.CmdAddresses, common.DefaultTimeout)
+	if err != nil {
+		return errors.Wrapf(err, "failed to receive addresses from %s", peerAddress)
+	}
+	msgAddresses := message.(*domainmessage.MsgAddresses)
+
+	added := amgr.AddAddresses(msgAddresses.AddrList)
+	log.Infof("Peer %s sent %d addresses, %d new",
+		peerAddress, len(msgAddresses.AddrList), added)
+
+	amgr.Attempt(addr.IP)
+	amgr.Good(addr.IP, requiredServices, nil)
+
+	return nil
+}
+
 func main() {
-	defer panics.HandlePanic(log, nil, nil)
+	defer panics.HandlePanic(log, "main", nil)
 	interrupt := signal.InterruptListener()
 
 	cfg, err := loadConfig()
@@ -168,6 +153,11 @@ func main() {
 
 	// Show version at startup.
 	log.Infof("Version %s", version.Version())
+
+	// Enable http profiling server if requested.
+	if cfg.Profile != "" {
+		profiling.Start(cfg.Profile, log)
+	}
 
 	amgr, err = NewManager(defaultHomeDir)
 	if err != nil {
@@ -195,18 +185,17 @@ func main() {
 			}
 		}
 		if ip != nil {
-			amgr.AddAddresses([]*wire.NetAddress{
-				wire.NewNetAddressIPPort(ip, uint16(peersDefaultPort),
-					requiredServices)})
+			defaultSeeder = domainmessage.NewNetAddressIPPort(ip, uint16(peersDefaultPort), requiredServices)
+			amgr.AddAddresses([]*domainmessage.NetAddress{defaultSeeder})
 		}
 	}
 
 	wg.Add(1)
-	spawn(creep)
+	spawn("main-creep", creep)
 
 	dnsServer := NewDNSServer(cfg.Host, cfg.Nameserver, cfg.Listen)
 	wg.Add(1)
-	spawn(dnsServer.Start)
+	spawn("main-DNSServer.Start", dnsServer.Start)
 
 	defer func() {
 		log.Infof("Gracefully shutting down the seeder...")

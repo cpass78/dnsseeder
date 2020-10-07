@@ -6,6 +6,8 @@ package main
 
 import (
 	"fmt"
+	"github.com/kaspanet/kaspad/dnsseed"
+	"github.com/kaspanet/kaspad/domainmessage"
 	"github.com/pkg/errors"
 	"net"
 	"os"
@@ -14,9 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kaspanet/kaspad/connmgr"
 	"github.com/kaspanet/kaspad/util/subnetworkid"
-	"github.com/kaspanet/kaspad/wire"
 	"github.com/miekg/dns"
 )
 
@@ -61,7 +61,8 @@ func (d *DNSServer) Start() {
 		}
 		_, addr, err := udpListen.ReadFromUDP(b)
 		if err != nil {
-			if err, ok := err.(net.Error); ok && err.Timeout() {
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
 				if atomic.LoadInt32(&systemShutdown) == 0 {
 					// use goto in order to do not re-allocate 'b' buffer
 					goto mainLoop
@@ -69,13 +70,19 @@ func (d *DNSServer) Start() {
 				log.Infof("DNS server shutdown")
 				return
 			}
-			log.Infof("Read: %T", err.(*net.OpError).Err)
+			var opErr *net.OpError
+			if errors.As(err, &opErr) {
+				log.Infof("Read: %T", opErr.Err)
+			} else {
+				log.Errorf("Unknown error: %s", err)
+			}
 			continue
 		}
 
 		wg.Add(1)
 
-		spawn(func() { d.handleDNSRequest(addr, authority, udpListen, b) })
+		spawn("DNSServer.Start-DNSServer.handleDNSRequest",
+			func() { d.handleDNSRequest(addr, authority, udpListen, b) })
 	}
 }
 
@@ -95,17 +102,17 @@ func NewDNSServer(hostname, nameserver, listen string) *DNSServer {
 	}
 }
 
-func (d *DNSServer) extractServicesSubnetworkID(addr *net.UDPAddr, domainName string) (wire.ServiceFlag, *subnetworkid.SubnetworkID, bool, error) {
+func (d *DNSServer) extractServicesSubnetworkID(addr *net.UDPAddr, domainName string) (domainmessage.ServiceFlag, *subnetworkid.SubnetworkID, bool, error) {
 	// Domain name may be in following format:
 	//   [n[subnetwork].][xservice.]hostname
 	// where connmgr.SubnetworkIDPrefixChar and connmgr.ServiceFlagPrefixChar are prefexes
-	wantedSF := wire.SFNodeNetwork
+	wantedSF := domainmessage.SFNodeNetwork
 	var subnetworkID *subnetworkid.SubnetworkID
 	includeAllSubnetworks := true
 	if d.hostname != domainName {
 		idx := 0
 		labels := dns.SplitDomainName(domainName)
-		if labels[0][0] == connmgr.SubnetworkIDPrefixChar {
+		if labels[0][0] == dnsseed.SubnetworkIDPrefixChar {
 			includeAllSubnetworks = false
 			if len(labels[0]) > 1 {
 				idx = 1
@@ -116,14 +123,14 @@ func (d *DNSServer) extractServicesSubnetworkID(addr *net.UDPAddr, domainName st
 				}
 			}
 		}
-		if labels[idx][0] == connmgr.ServiceFlagPrefixChar && len(labels[idx]) > 1 {
+		if labels[idx][0] == dnsseed.ServiceFlagPrefixChar && len(labels[idx]) > 1 {
 			wantedSFStr := labels[idx][1:]
 			u, err := strconv.ParseUint(wantedSFStr, 10, 64)
 			if err != nil {
 				log.Infof("%s: ParseUint: %v", addr, err)
 				return wantedSF, subnetworkID, includeAllSubnetworks, err
 			}
-			wantedSF = wire.ServiceFlag(u)
+			wantedSF = domainmessage.ServiceFlag(u)
 		}
 	}
 	return wantedSF, subnetworkID, includeAllSubnetworks, nil
@@ -171,7 +178,7 @@ func translateDNSQuestion(addr *net.UDPAddr, dnsMsg *dns.Msg) (string, error) {
 }
 
 func (d *DNSServer) buildDNSResponse(addr *net.UDPAddr, authority dns.RR, dnsMsg *dns.Msg,
-	wantedSF wire.ServiceFlag, includeAllSubnetworks bool, subnetworkID *subnetworkid.SubnetworkID, atype string) ([]byte, error) {
+	wantedSF domainmessage.ServiceFlag, includeAllSubnetworks bool, subnetworkID *subnetworkid.SubnetworkID, atype string) ([]byte, error) {
 	respMsg := dnsMsg.Copy()
 	respMsg.Authoritative = true
 	respMsg.Response = true
